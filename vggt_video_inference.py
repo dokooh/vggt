@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import List, Union, Optional
 import argparse
 from tqdm import tqdm
+import os
+import sys
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -30,7 +32,7 @@ class VideoFrameExtractor:
         
         Args:
             video_path: Path to input video file
-            output_dir: Directory to save extracted frames (default: video_name_frames/)
+            output_dir: Directory to save extracted frames (default: video_name_frames/ in writable location)
             frame_interval: Extract every N-th frame (1 = all frames)
             max_frames: Maximum number of frames to extract
             skip_frames: Number of initial frames to skip
@@ -44,12 +46,34 @@ class VideoFrameExtractor:
         if not self.video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
+        # Handle output directory - use Kaggle working directory if input is read-only
         if output_dir is None:
-            self.output_dir = self.video_path.parent / f"{self.video_path.stem}_frames"
+            proposed_dir = self.video_path.parent / f"{self.video_path.stem}_frames"
+            
+            # Check if parent directory is writable
+            if self._is_writable(self.video_path.parent):
+                self.output_dir = proposed_dir
+            else:
+                # Fall back to Kaggle working directory or current working directory
+                if self._is_kaggle_environment():
+                    self.output_dir = Path("/kaggle/working") / f"{self.video_path.stem}_frames"
+                else:
+                    self.output_dir = Path.cwd() / f"{self.video_path.stem}_frames"
         else:
             self.output_dir = Path(output_dir)
         
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure output directory is writable
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # If still can't create in specified location, use fallback
+            print(f"Warning: Cannot create directory at {self.output_dir}: {e}")
+            if self._is_kaggle_environment():
+                self.output_dir = Path("/kaggle/working") / f"{self.video_path.stem}_frames"
+            else:
+                self.output_dir = Path.cwd() / f"{self.video_path.stem}_frames"
+            print(f"Using fallback directory: {self.output_dir}")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.frame_interval = frame_interval
         self.max_frames = max_frames
@@ -60,6 +84,22 @@ class VideoFrameExtractor:
         self.motion_blur_threshold = motion_blur_threshold
         
         self.extracted_frames: List[str] = []
+    
+    @staticmethod
+    def _is_kaggle_environment() -> bool:
+        """Check if running in Kaggle environment."""
+        return os.path.exists("/kaggle/working")
+    
+    @staticmethod
+    def _is_writable(path: Path) -> bool:
+        """Check if a directory is writable."""
+        try:
+            test_file = path / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+            return True
+        except (OSError, PermissionError):
+            return False
     
     def compute_blur_score(self, frame: np.ndarray) -> float:
         """
@@ -337,7 +377,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        help="Directory to save extracted frames"
+        help="Directory to save extracted frames (defaults to /kaggle/working/ on Kaggle)"
     )
     parser.add_argument(
         "--frame_interval",
