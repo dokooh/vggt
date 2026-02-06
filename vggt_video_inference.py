@@ -2,14 +2,232 @@ import torch
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict
 import argparse
 from tqdm import tqdm
 import os
 import sys
+import json
+import pickle
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
+
+
+class PredictionSaver:
+    """Save VGGT predictions in multiple formats."""
+    
+    def __init__(self, output_dir: str):
+        """
+        Initialize prediction saver.
+        
+        Args:
+            output_dir: Directory to save predictions
+        """
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.predictions_dir = self.output_dir / "predictions"
+        self.predictions_dir.mkdir(exist_ok=True)
+    
+    def save_predictions(
+        self,
+        predictions: Dict,
+        image_names: List[str],
+        formats: List[str] = ["numpy", "pickle", "json_metadata"]
+    ) -> Dict[str, Path]:
+        """
+        Save predictions in multiple formats.
+        
+        Args:
+            predictions: Dictionary of model predictions
+            image_names: List of image paths used for inference
+            formats: List of formats to save ("numpy", "pickle", "json_metadata", "npy")
+            
+        Returns:
+            Dictionary of saved file paths
+        """
+        print("\n" + "=" * 60)
+        print("SAVING PREDICTIONS")
+        print("=" * 60)
+        print(f"Predictions directory: {self.predictions_dir}")
+        
+        saved_paths = {}
+        
+        # Save as NumPy files
+        if "numpy" in formats or "npy" in formats:
+            saved_paths.update(self._save_as_numpy(predictions))
+        
+        # Save as Pickle
+        if "pickle" in formats:
+            saved_paths.update(self._save_as_pickle(predictions))
+        
+        # Save metadata as JSON
+        if "json_metadata" in formats:
+            saved_paths.update(self._save_metadata_as_json(predictions, image_names))
+        
+        # Save complete predictions as pickle (full data)
+        if "full_pickle" in formats:
+            saved_paths.update(self._save_full_predictions_pickle(predictions))
+        
+        # Save depth maps as PNG
+        if "depth_png" in formats:
+            saved_paths.update(self._save_depth_as_png(predictions))
+        
+        print(f"\n{'=' * 60}")
+        print("PREDICTIONS SAVED")
+        print(f"{'=' * 60}")
+        print(f"Total files saved: {len(saved_paths)}")
+        for name, path in saved_paths.items():
+            size = self._get_file_size(path)
+            print(f"  ✅ {name}: {path.name} ({size})")
+        
+        return saved_paths
+    
+    def _save_as_numpy(self, predictions: Dict) -> Dict[str, Path]:
+        """Save predictions as separate NumPy files."""
+        saved = {}
+        
+        print("\nSaving as NumPy arrays (.npy)...")
+        
+        for key, value in predictions.items():
+            if torch.is_tensor(value):
+                # Convert to numpy and move to CPU
+                np_array = value.cpu().numpy()
+                
+                # Save individual file
+                filepath = self.predictions_dir / f"{key}.npy"
+                np.save(str(filepath), np_array)
+                saved[f"numpy_{key}"] = filepath
+                
+                print(f"  ✓ {key}: shape {np_array.shape}, dtype {np_array.dtype}")
+            
+            elif isinstance(value, list):
+                # Handle lists (e.g., pose_enc_list)
+                print(f"  ⊘ {key}: list (skipped, use pickle for full data)")
+        
+        return saved
+    
+    def _save_as_pickle(self, predictions: Dict) -> Dict[str, Path]:
+        """Save predictions as Pickle files (tensor-compatible)."""
+        print("\nSaving as Pickle (.pkl)...")
+        
+        saved = {}
+        
+        for key, value in predictions.items():
+            if torch.is_tensor(value):
+                filepath = self.predictions_dir / f"{key}.pkl"
+                torch.save(value, str(filepath))
+                saved[f"pickle_{key}"] = filepath
+                print(f"  ✓ {key}: {filepath.name}")
+            
+            elif isinstance(value, list):
+                filepath = self.predictions_dir / f"{key}_list.pkl"
+                with open(filepath, 'wb') as f:
+                    pickle.dump(value, f)
+                saved[f"pickle_{key}_list"] = filepath
+                print(f"  ✓ {key} (list): {filepath.name}")
+        
+        return saved
+    
+    def _save_metadata_as_json(self, predictions: Dict, image_names: List[str]) -> Dict[str, Path]:
+        """Save prediction metadata (shapes, dtypes, image names) as JSON."""
+        print("\nSaving metadata as JSON...")
+        
+        metadata = {
+            "num_images": len(image_names),
+            "image_names": image_names,
+            "predictions": {}
+        }
+        
+        for key, value in predictions.items():
+            if torch.is_tensor(value):
+                metadata["predictions"][key] = {
+                    "type": "tensor",
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "device": str(value.device),
+                    "filename": f"{key}.npy"
+                }
+            elif isinstance(value, list):
+                metadata["predictions"][key] = {
+                    "type": "list",
+                    "length": len(value),
+                    "filename": f"{key}_list.pkl"
+                }
+        
+        filepath = self.predictions_dir / "metadata.json"
+        with open(filepath, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"  ✓ Metadata: {filepath.name}")
+        
+        return {"json_metadata": filepath}
+    
+    def _save_full_predictions_pickle(self, predictions: Dict) -> Dict[str, Path]:
+        """Save complete predictions dictionary as single pickle file."""
+        print("\nSaving complete predictions as Pickle...")
+        
+        filepath = self.predictions_dir / "predictions_full.pkl"
+        
+        # Convert tensors to numpy for easier loading
+        predictions_serializable = {}
+        for key, value in predictions.items():
+            if torch.is_tensor(value):
+                predictions_serializable[key] = value.cpu().numpy()
+            else:
+                predictions_serializable[key] = value
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(predictions_serializable, f)
+        
+        size = filepath.stat().st_size / (1024 * 1024)
+        print(f"  ✓ Complete predictions: {filepath.name} ({size:.2f} MB)")
+        
+        return {"full_pickle": filepath}
+    
+    def _save_depth_as_png(self, predictions: Dict) -> Dict[str, Path]:
+        """Save depth maps as PNG (normalized)."""
+        if "depth" not in predictions:
+            return {}
+        
+        print("\nSaving depth maps as PNG...")
+        
+        depth = predictions["depth"].cpu().numpy()  # [B, N, H, W, 1]
+        
+        saved = {}
+        
+        for b in range(depth.shape[0]):
+            for n in range(depth.shape[1]):
+                depth_map = depth[b, n, :, :, 0]
+                
+                # Normalize to 0-255
+                depth_min = depth_map.min()
+                depth_max = depth_map.max()
+                
+                if depth_max > depth_min:
+                    depth_normalized = ((depth_map - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+                else:
+                    depth_normalized = np.zeros_like(depth_map, dtype=np.uint8)
+                
+                filepath = self.predictions_dir / f"depth_b{b:02d}_n{n:02d}.png"
+                cv2.imwrite(str(filepath), depth_normalized)
+                saved[f"depth_png_b{b}_n{n}"] = filepath
+        
+        print(f"  ✓ Saved {len(saved)} depth maps")
+        
+        return saved
+    
+    @staticmethod
+    def _get_file_size(filepath: Path) -> str:
+        """Get human-readable file size."""
+        size_bytes = filepath.stat().st_size
+        
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        
+        return f"{size_bytes:.1f} TB"
 
 
 class VideoFrameExtractor:
@@ -285,8 +503,10 @@ def run_vggt_inference(
     image_names: List[str],
     model_name: str = "facebook/VGGT-1B",
     device: Optional[str] = None,
-    batch_size: int = 1
-) -> dict:
+    batch_size: int = 1,
+    save_predictions: bool = True,
+    predictions_output_dir: Optional[str] = None
+) -> Dict:
     """
     Run VGGT inference on images.
     
@@ -295,6 +515,8 @@ def run_vggt_inference(
         model_name: VGGT model name
         device: Device to run on (auto-detect if None)
         batch_size: Process images in batches
+        save_predictions: Whether to save predictions
+        predictions_output_dir: Directory to save predictions
         
     Returns:
         Dictionary of predictions
@@ -345,6 +567,23 @@ def run_vggt_inference(
             print(f"  {key}: {value.shape} ({value.dtype})")
         else:
             print(f"  {key}: {type(value)}")
+    
+    # Save predictions
+    if save_predictions:
+        if predictions_output_dir is None:
+            if os.path.exists("/kaggle/working"):
+                predictions_output_dir = "/kaggle/working"
+            else:
+                predictions_output_dir = os.getcwd()
+        
+        saver = PredictionSaver(predictions_output_dir)
+        saved_paths = saver.save_predictions(
+            predictions=predictions,
+            image_names=image_names,
+            formats=["numpy", "pickle", "json_metadata", "full_pickle", "depth_png"]
+        )
+        
+        predictions["_saved_paths"] = saved_paths
     
     return predictions
 
@@ -455,6 +694,24 @@ def main():
         help="Only extract frames, skip VGGT inference"
     )
     
+    # Predictions saving
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        default=True,
+        help="Save predictions to disk (default: True)"
+    )
+    parser.add_argument(
+        "--predictions_dir",
+        type=str,
+        help="Directory to save predictions (default: /kaggle/working/)"
+    )
+    parser.add_argument(
+        "--skip_save_predictions",
+        action="store_true",
+        help="Don't save predictions"
+    )
+    
     args = parser.parse_args()
     
     # Get image names
@@ -499,14 +756,24 @@ def main():
             print("Error: No images to process!")
             return
         
+        save_preds = args.save_predictions and not args.skip_save_predictions
+        
         predictions = run_vggt_inference(
             image_names=image_names,
             model_name=args.model,
-            device=args.device
+            device=args.device,
+            save_predictions=save_preds,
+            predictions_output_dir=args.predictions_dir
         )
         
-        # You can now use predictions for further processing
-        # predictions contains: cameras, depth_maps, point_maps, etc.
+        # Print saved paths
+        if save_preds and "_saved_paths" in predictions:
+            print("\n" + "=" * 60)
+            print("SAVED FILES SUMMARY")
+            print("=" * 60)
+            for name, path in predictions["_saved_paths"].items():
+                print(f"✅ {name}")
+                print(f"   Path: {path}")
     
     else:
         print(f"\nSkipping inference. {len(image_names)} frames ready for processing.")
