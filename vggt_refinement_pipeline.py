@@ -17,6 +17,27 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 import struct
 import cv2
+import sys
+import os
+from tqdm import tqdm
+
+
+# Check for optional dependencies
+OPTIONAL_DEPS = {}
+
+try:
+    import trimesh
+    OPTIONAL_DEPS['trimesh'] = True
+except ImportError:
+    OPTIONAL_DEPS['trimesh'] = False
+    print("⚠️  trimesh not installed - 3D visualization features disabled")
+
+try:
+    import pycolmap
+    OPTIONAL_DEPS['pycolmap'] = True
+except ImportError:
+    OPTIONAL_DEPS['pycolmap'] = False
+    print("⚠️  pycolmap not installed - COLMAP integration features disabled")
 
 
 class VGGTRefinementPipeline:
@@ -34,14 +55,48 @@ class VGGTRefinementPipeline:
         self.output_dir = Path(output_dir) if output_dir else self.scene_dir / "refined"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Create subdirectories
+        self.colmap_dir = self.output_dir / "colmap_ba"
+        self.colmap_dir.mkdir(exist_ok=True)
+        
+        self.depths_dir = self.output_dir / "depths"
+        self.depths_dir.mkdir(exist_ok=True)
+        
+        self.pointclouds_dir = self.output_dir / "pointclouds"
+        self.pointclouds_dir.mkdir(exist_ok=True)
+        
+        print(f"\n{'='*60}")
+        print("VGGT REFINEMENT PIPELINE")
+        print(f"{'='*60}")
+        print(f"Scene directory: {self.scene_dir}")
+        print(f"Output directory: {self.output_dir}")
+    
     # ==================== STEP 1: Bundle Adjustment ====================
+    
+    def check_vggt_demo_script(self) -> bool:
+        """Check if demo_colmap.py exists in VGGT installation."""
+        possible_paths = [
+            Path.cwd() / "demo_colmap.py",
+            self.scene_dir / "demo_colmap.py",
+            Path("/kaggle/working/vggt/demo_colmap.py"),
+            Path.home() / "vggt" / "demo_colmap.py",
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                print(f"Found demo_colmap.py at: {path}")
+                return True
+        
+        print("⚠️  demo_colmap.py not found. Make sure VGGT is properly installed.")
+        return False
     
     def run_bundle_adjustment(
         self, 
         max_query_pts: int = 4096,
         query_frame_num: int = 3,
-        use_ba: bool = True
-    ) -> Path:
+        use_ba: bool = True,
+        demo_script_path: Optional[str] = None
+    ) -> Optional[Path]:
         """
         Run Bundle Adjustment using VGGT's demo_colmap.py script.
         
@@ -49,20 +104,30 @@ class VGGTRefinementPipeline:
             max_query_pts: Maximum query points for BA
             query_frame_num: Number of query frames
             use_ba: Enable bundle adjustment
+            demo_script_path: Path to demo_colmap.py (auto-detect if None)
             
         Returns:
-            Path to COLMAP output directory
+            Path to COLMAP output directory, or None if failed
         """
         print("=" * 60)
         print("STEP 1: Running Bundle Adjustment")
         print("=" * 60)
         
-        colmap_dir = self.output_dir / "colmap_ba"
-        colmap_dir.mkdir(exist_ok=True)
+        # Find demo_colmap.py
+        if demo_script_path is None:
+            if not self.check_vggt_demo_script():
+                print("\n⚠️  SKIPPING Bundle Adjustment - demo_colmap.py not found")
+                print("Make sure VGGT is properly installed:")
+                print("  git clone https://github.com/facebookresearch/vggt.git")
+                print("  cd vggt && pip install -e .")
+                return None
+            
+            # Try to find it
+            demo_script_path = "demo_colmap.py"
         
         # Construct command for VGGT's BA script
         cmd = [
-            "python", "demo_colmap.py",
+            sys.executable, str(demo_script_path),
             f"--scene_dir={self.scene_dir}",
             f"--max_query_pts={max_query_pts}",
             f"--query_frame_num={query_frame_num}",
@@ -72,17 +137,39 @@ class VGGTRefinementPipeline:
             cmd.append("--use_ba")
         
         print(f"Running command: {' '.join(cmd)}")
+        print("\nNote: This may take a while (especially on first run)...\n")
         
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print("Bundle Adjustment completed successfully!")
+            result = subprocess.run(
+                cmd, 
+                check=True, 
+                capture_output=True, 
+                text=True,
+                cwd=self.scene_dir
+            )
+            print("✅ Bundle Adjustment completed successfully!")
             print(result.stdout)
+            return self.colmap_dir
+            
         except subprocess.CalledProcessError as e:
-            print(f"Error running Bundle Adjustment: {e}")
-            print(f"stderr: {e.stderr}")
-            raise
-        
-        return colmap_dir
+            print(f"❌ Error running Bundle Adjustment:")
+            print(f"Return code: {e.returncode}")
+            print(f"\nSTDOUT:\n{e.stdout}")
+            print(f"\nSTDERR:\n{e.stderr}")
+            
+            # Check for missing dependencies
+            if "ModuleNotFoundError" in e.stderr or "ImportError" in e.stderr:
+                missing_module = None
+                for line in e.stderr.split('\n'):
+                    if "ModuleNotFoundError" in line or "ImportError" in line:
+                        missing_module = line
+                        break
+                
+                print(f"\n⚠️  Missing dependency detected: {missing_module}")
+                print("\nInstall missing dependencies with:")
+                print("  pip install trimesh pycolmap")
+            
+            return None
     
     # ==================== STEP 2: Metric Scaling with GCPs ====================
     
@@ -139,15 +226,15 @@ class VGGTRefinementPipeline:
                 'translation': np.zeros(3)
             }
             
-            print(f"Computed scale factor: {scale:.6f}")
-            print(f"Current distance: {current_dist:.3f} -> Actual: {actual_dist:.3f}m")
+            print(f"✅ Computed scale factor: {scale:.6f}")
+            print(f"   Current distance: {current_dist:.3f} → Actual: {actual_dist:.3f}m")
             
         elif gcp_file is not None:
             # Use GCPs for similarity transformation
             gcps = self.load_ground_control_points(gcp_file)
             transform = self._compute_similarity_transform_from_gcps(point_cloud, gcps)
         else:
-            print("Warning: No scaling information provided. Skipping metric scaling.")
+            print("⚠️  No scaling information provided. Skipping metric scaling.")
             return point_cloud, {'scale': 1.0, 'rotation': np.eye(3), 'translation': np.zeros(3)}
         
         # Apply transformation
@@ -161,9 +248,6 @@ class VGGTRefinementPipeline:
         gcps: List[Dict]
     ) -> Dict:
         """Compute 7-DoF similarity transform from GCPs."""
-        # This is a simplified version. For production, use COLMAP's alignment tools
-        # or implement robust estimation with RANSAC
-        
         if len(gcps) < 3:
             raise ValueError("Need at least 3 GCPs for similarity transform")
         
@@ -172,13 +256,9 @@ class VGGTRefinementPipeline:
         dst_points = []
         
         for gcp in gcps:
-            # Find closest point in cloud to pixel coordinate
-            # (This is simplified - in practice, use camera projection)
             world_coord = np.array(gcp['world_coords'])
             dst_points.append(world_coord)
             
-            # Placeholder: In real implementation, project pixel to 3D using camera params
-            # For now, assume we have approximate 3D positions
             if 'approx_3d' in gcp:
                 src_points.append(np.array(gcp['approx_3d']))
         
@@ -210,9 +290,9 @@ class VGGTRefinementPipeline:
         # Compute translation
         t = dst_center - scale * R @ src_center
         
-        print(f"Similarity transform computed:")
-        print(f"  Scale: {scale:.6f}")
-        print(f"  Translation: {t}")
+        print(f"✅ Similarity transform computed:")
+        print(f"   Scale: {scale:.6f}")
+        print(f"   Translation: {t}")
         
         return {'scale': scale, 'rotation': R, 'translation': t}
     
@@ -290,7 +370,6 @@ class VGGTRefinementPipeline:
         points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
         
         # Transform to world coordinates
-        # extrinsic: world to camera, so we need its inverse
         cam_to_world = np.linalg.inv(extrinsic)
         points_world_homogeneous = points_cam @ cam_to_world[:3, :3].T + cam_to_world[:3, 3]
         
@@ -339,7 +418,7 @@ class VGGTRefinementPipeline:
             if pcd.has_colors():
                 all_colors.append(np.asarray(pcd.colors))
             
-            print(f"Unprojected depth map {i+1}/{len(depth_maps)}: {len(pcd.points)} points")
+            print(f"✓ Unprojected depth map {i+1}/{len(depth_maps)}: {len(pcd.points)} points")
         
         # Combine all points
         fused_pcd = o3d.geometry.PointCloud()
@@ -348,7 +427,7 @@ class VGGTRefinementPipeline:
         if all_colors:
             fused_pcd.colors = o3d.utility.Vector3dVector(np.vstack(all_colors))
         
-        print(f"Fused point cloud: {len(fused_pcd.points)} total points")
+        print(f"✅ Fused point cloud: {len(fused_pcd.points)} total points")
         
         return fused_pcd
     
@@ -392,35 +471,35 @@ class VGGTRefinementPipeline:
         print(f"Initial points: {initial_points}")
         
         # Statistical outlier removal
-        if remove_statistical_outliers:
+        if remove_statistical_outliers and initial_points > 0:
             print(f"Applying statistical outlier removal...")
             cleaned_pcd, ind = cleaned_pcd.remove_statistical_outlier(
                 nb_neighbors=statistical_nb_neighbors,
                 std_ratio=statistical_std_ratio
             )
-            print(f"  Removed {initial_points - len(cleaned_pcd.points)} outliers")
-            print(f"  Remaining points: {len(cleaned_pcd.points)}")
+            print(f"  ✓ Removed {initial_points - len(cleaned_pcd.points)} outliers")
+            print(f"  ✓ Remaining points: {len(cleaned_pcd.points)}")
         
         # Radius outlier removal
-        if remove_radius_outliers:
+        if remove_radius_outliers and len(cleaned_pcd.points) > 0:
             print(f"Applying radius outlier removal...")
             before = len(cleaned_pcd.points)
             cleaned_pcd, ind = cleaned_pcd.remove_radius_outlier(
                 nb_points=radius_filter_nb_points,
                 radius=radius_filter_radius
             )
-            print(f"  Removed {before - len(cleaned_pcd.points)} sparse points")
-            print(f"  Remaining points: {len(cleaned_pcd.points)}")
+            print(f"  ✓ Removed {before - len(cleaned_pcd.points)} sparse points")
+            print(f"  ✓ Remaining points: {len(cleaned_pcd.points)}")
         
         # Voxel downsampling
-        if downsample:
+        if downsample and len(cleaned_pcd.points) > 0:
             print(f"Applying voxel downsampling (voxel_size={voxel_size})...")
             before = len(cleaned_pcd.points)
             cleaned_pcd = cleaned_pcd.voxel_down_sample(voxel_size=voxel_size)
-            print(f"  Downsampled from {before} to {len(cleaned_pcd.points)} points")
+            print(f"  ✓ Downsampled from {before} to {len(cleaned_pcd.points)} points")
         
         # Estimate normals if not present
-        if not cleaned_pcd.has_normals():
+        if not cleaned_pcd.has_normals() and len(cleaned_pcd.points) > 0:
             print("Estimating normals...")
             cleaned_pcd.estimate_normals(
                 search_param=o3d.geometry.KDTreeSearchParamHybrid(
@@ -428,7 +507,7 @@ class VGGTRefinementPipeline:
                 )
             )
         
-        print(f"Final point cloud: {len(cleaned_pcd.points)} points")
+        print(f"✅ Final point cloud: {len(cleaned_pcd.points)} points")
         
         return cleaned_pcd
     
@@ -438,7 +517,6 @@ class VGGTRefinementPipeline:
         """Load VGGT point cloud output."""
         print(f"Loading VGGT point cloud from {point_cloud_path}")
         
-        # VGGT may output .ply, .pcd, or numpy arrays
         path = Path(point_cloud_path)
         
         if path.suffix in ['.ply', '.pcd']:
@@ -455,14 +533,15 @@ class VGGTRefinementPipeline:
         else:
             raise ValueError(f"Unsupported file format: {path.suffix}")
         
-        print(f"Loaded {len(pcd.points)} points")
+        print(f"✅ Loaded {len(pcd.points)} points")
         return pcd
     
-    def save_point_cloud(self, point_cloud: o3d.geometry.PointCloud, filename: str):
+    def save_point_cloud(self, point_cloud: o3d.geometry.PointCloud, filename: str) -> Path:
         """Save point cloud to file."""
-        output_path = self.output_dir / filename
+        output_path = self.pointclouds_dir / filename
         o3d.io.write_point_cloud(str(output_path), point_cloud)
-        print(f"Saved point cloud to {output_path}")
+        print(f"✅ Saved point cloud to {output_path}")
+        return output_path
     
     def visualize_point_cloud(self, point_cloud: o3d.geometry.PointCloud, window_name: str = "Point Cloud"):
         """Visualize point cloud with Open3D."""
@@ -499,11 +578,40 @@ class VGGTRefinementPipeline:
             print(f"Distance between point {i} and {j}: {dist:.4f} m")
         
         return distances
+    
+    def print_summary(self):
+        """Print pipeline summary."""
+        print("\n" + "=" * 60)
+        print("PIPELINE SUMMARY")
+        print("=" * 60)
+        print(f"Output directory: {self.output_dir}")
+        print(f"\nGenerated subdirectories:")
+        print(f"  📁 {self.colmap_dir.name}/")
+        print(f"  📁 {self.depths_dir.name}/")
+        print(f"  📁 {self.pointclouds_dir.name}/")
+        print("\nOptional dependencies:")
+        for dep, installed in OPTIONAL_DEPS.items():
+            status = "✅" if installed else "⚠️"
+            print(f"  {status} {dep}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VGGT Point Cloud Refinement Pipeline"
+        description="VGGT Point Cloud Refinement Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic refinement with Bundle Adjustment
+  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply --use_ba
+  
+  # With metric scaling using known distance
+  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply \\
+    --known_distance 2.5 --point_indices 100 500
+  
+  # With GCP file
+  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply \\
+    --gcp_file ground_control_points.json --visualize
+        """
     )
     
     # Input/Output
@@ -528,20 +636,25 @@ def main():
     parser.add_argument(
         "--use_ba",
         action="store_true",
-        default=True,
-        help="Run bundle adjustment"
+        default=False,
+        help="Run bundle adjustment (requires demo_colmap.py from VGGT)"
+    )
+    parser.add_argument(
+        "--demo_script",
+        type=str,
+        help="Path to demo_colmap.py script"
     )
     parser.add_argument(
         "--max_query_pts",
         type=int,
         default=4096,
-        help="Max query points for BA"
+        help="Max query points for BA (default: 4096)"
     )
     parser.add_argument(
         "--query_frame_num",
         type=int,
         default=3,
-        help="Number of query frames for BA"
+        help="Number of query frames for BA (default: 3)"
     )
     
     # Metric Scaling
@@ -567,7 +680,7 @@ def main():
         "--voxel_size",
         type=float,
         default=0.01,
-        help="Voxel size for downsampling (meters)"
+        help="Voxel size for downsampling (meters, default: 0.01)"
     )
     parser.add_argument(
         "--no_denoise",
@@ -587,21 +700,21 @@ def main():
     
     # Step 1: Bundle Adjustment (optional)
     if args.use_ba:
-        colmap_dir = pipeline.run_bundle_adjustment(
+        result = pipeline.run_bundle_adjustment(
             max_query_pts=args.max_query_pts,
             query_frame_num=args.query_frame_num,
-            use_ba=True
+            use_ba=True,
+            demo_script_path=args.demo_script
         )
-        # After BA, load the refined point cloud from COLMAP output
-        # (This would require reading COLMAP's points3D.bin - see helper below)
-        print(f"Bundle adjustment completed. COLMAP output in {colmap_dir}")
-        print("Load refined point cloud from COLMAP output (points3D.bin)")
+        if result is None:
+            print("\n⚠️  Continuing without Bundle Adjustment...")
     
     # Load point cloud
     if args.point_cloud:
         point_cloud = pipeline.load_vggt_point_cloud(args.point_cloud)
     else:
-        print("Warning: No point cloud specified. Skipping to next steps.")
+        print("⚠️  No point cloud specified. Skipping to next steps.")
+        pipeline.print_summary()
         return
     
     # Step 2: Metric Scaling
@@ -636,11 +749,14 @@ def main():
     if args.visualize:
         pipeline.visualize_point_cloud(point_cloud, "Refined Point Cloud")
     
+    # Summary
+    pipeline.print_summary()
+    
     print("\n" + "=" * 60)
     print("REFINEMENT PIPELINE COMPLETED")
     print("=" * 60)
-    print(f"Final point cloud: {len(point_cloud.points)} points")
-    print(f"Output directory: {pipeline.output_dir}")
+    print(f"✅ Final point cloud: {len(point_cloud.points)} points")
+    print(f"📁 Output directory: {pipeline.output_dir}")
 
 
 if __name__ == "__main__":
