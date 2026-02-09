@@ -13,6 +13,7 @@ import open3d as o3d
 import argparse
 import subprocess
 import json
+import pickle
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 import struct
@@ -532,7 +533,7 @@ class VGGTRefinementPipeline:
     # ==================== Utility Functions ====================
     
     def load_vggt_point_cloud(self, point_cloud_path: str) -> o3d.geometry.PointCloud:
-        """Load VGGT point cloud output."""
+        """Load VGGT point cloud output (supports .npy, .pkl, .npz, .ply, .pcd)."""
         print(f"Loading VGGT point cloud from {point_cloud_path}")
         
         path = Path(point_cloud_path)
@@ -541,8 +542,8 @@ class VGGTRefinementPipeline:
         if path.is_dir():
             print(f"⚠️  Path is a directory. Searching for point cloud files...")
             
-            # Search for common point cloud files
-            for pattern in ['*.ply', '*.pcd', '*.npy', '*.npz']:
+            # Search for VGGT output files (prioritize .pkl and .npy from VGGT)
+            for pattern in ['*.pkl', '*.npy', '*.npz', '*.ply', '*.pcd']:
                 files = list(path.glob(pattern))
                 if files:
                     # Use the first found file
@@ -552,35 +553,176 @@ class VGGTRefinementPipeline:
             else:
                 raise ValueError(
                     f"No point cloud files found in directory: {point_cloud_path}\n"
-                    f"Expected files with extensions: .ply, .pcd, .npy, .npz"
+                    f"Expected files with extensions: .pkl, .npy, .npz, .ply, .pcd"
                 )
         
         if not path.exists():
             raise FileNotFoundError(f"Point cloud file not found: {path}")
         
+        print(f"Loading file: {path.name} (format: {path.suffix})")
+        
+        # Load based on file format
         if path.suffix in ['.ply', '.pcd']:
             pcd = o3d.io.read_point_cloud(str(path))
-        elif path.suffix in ['.npy', '.npz']:
+            
+        elif path.suffix == '.pkl':
+            # VGGT pickle format
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            pcd = self._convert_vggt_data_to_pointcloud(data, 'pkl')
+            
+        elif path.suffix == '.npy':
+            # VGGT numpy format
+            data = np.load(path, allow_pickle=True)
+            pcd = self._convert_vggt_data_to_pointcloud(data, 'npy')
+            
+        elif path.suffix == '.npz':
+            # Compressed numpy format
             data = np.load(path)
-            pcd = o3d.geometry.PointCloud()
-            if isinstance(data, np.ndarray):
-                pcd.points = o3d.utility.Vector3dVector(data)
-            else:  # npz
-                pcd.points = o3d.utility.Vector3dVector(data['points'])
-                if 'colors' in data:
-                    pcd.colors = o3d.utility.Vector3dVector(data['colors'])
+            pcd = self._convert_vggt_data_to_pointcloud(data, 'npz')
+            
         else:
             raise ValueError(f"Unsupported file format: {path.suffix}")
         
         print(f"✅ Loaded {len(pcd.points)} points")
+        
+        # Auto-save as PLY if source was not PLY
+        if path.suffix not in ['.ply', '.pcd']:
+            ply_path = self.pointclouds_dir / f"{path.stem}_converted.ply"
+            o3d.io.write_point_cloud(str(ply_path), pcd)
+            print(f"💾 Saved PLY version to: {ply_path.name}")
+        
         return pcd
     
-    def save_point_cloud(self, point_cloud: o3d.geometry.PointCloud, filename: str) -> Path:
-        """Save point cloud to file."""
+    def _convert_vggt_data_to_pointcloud(self, data, format_type: str) -> o3d.geometry.PointCloud:
+        """Convert VGGT data structures to Open3D point cloud."""
+        pcd = o3d.geometry.PointCloud()
+        
+        if format_type == 'pkl':
+            # Handle pickle format - could be dict or direct array
+            if isinstance(data, dict):
+                if 'points' in data:
+                    points = np.array(data['points'])
+                elif 'xyz' in data:
+                    points = np.array(data['xyz'])
+                elif 'vertices' in data:
+                    points = np.array(data['vertices'])
+                elif 'point_cloud' in data:
+                    points = np.array(data['point_cloud'])
+                else:
+                    # Try to find array-like values
+                    for key, value in data.items():
+                        if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[1] == 3:
+                            points = value
+                            print(f"  Using key '{key}' as point coordinates")
+                            break
+                    else:
+                        raise ValueError(f"Could not find 3D points in pickle data. Keys: {list(data.keys())}")
+                
+                # Try to extract colors if available
+                if 'colors' in data:
+                    colors = np.array(data['colors'])
+                    if colors.max() > 1.0:
+                        colors = colors / 255.0
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                elif 'rgb' in data:
+                    colors = np.array(data['rgb'])
+                    if colors.max() > 1.0:
+                        colors = colors / 255.0
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+            else:
+                # Direct array
+                points = np.array(data)
+                if points.ndim == 1:
+                    points = points.reshape(-1, 3)
+            
+        elif format_type == 'npy':
+            # Handle .npy format
+            if isinstance(data, np.ndarray):
+                if data.dtype == object:
+                    # Might be a pickled object in npy
+                    data = data.item()
+                    return self._convert_vggt_data_to_pointcloud(data, 'pkl')
+                else:
+                    points = data
+                    if points.ndim == 1 and points.shape[0] % 3 == 0:
+                        points = points.reshape(-1, 3)
+            else:
+                raise ValueError(f"Unexpected npy data type: {type(data)}")
+        
+        elif format_type == 'npz':
+            # Handle .npz format
+            if 'points' in data:
+                points = data['points']
+            elif 'xyz' in data:
+                points = data['xyz']
+            else:
+                # Use first array that looks like 3D points
+                for key in data.files:
+                    arr = data[key]
+                    if arr.ndim == 2 and arr.shape[1] == 3:
+                        points = arr
+                        print(f"  Using key '{key}' as point coordinates")
+                        break
+                else:
+                    raise ValueError(f"Could not find 3D points in npz data. Files: {data.files}")
+            
+            if 'colors' in data:
+                colors = data['colors']
+                if colors.max() > 1.0:
+                    colors = colors / 255.0
+                pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # Ensure points are Nx3
+        if points.shape[1] != 3:
+            raise ValueError(f"Expected Nx3 points, got shape {points.shape}")
+        
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        return pcd
+    
+    def save_point_cloud(self, point_cloud: o3d.geometry.PointCloud, filename: str, format: Optional[str] = None) -> Path:
+        """
+        Save point cloud to file.
+        
+        Args:
+            point_cloud: Point cloud to save
+            filename: Output filename (extension determines format if format is None)
+            format: Force specific format ('ply', 'pcd', 'xyz', 'xyzrgb', 'pts')
+        """
         output_path = self.pointclouds_dir / filename
+        
+        # Override extension if format is specified
+        if format:
+            output_path = output_path.with_suffix(f'.{format}')
+        
+        # Ensure the format is supported
+        if output_path.suffix.lower() not in ['.ply', '.pcd', '.xyz', '.xyzn', '.xyzrgb', '.pts']:
+            print(f"⚠️  Format {output_path.suffix} not supported by Open3D, defaulting to .ply")
+            output_path = output_path.with_suffix('.ply')
+        
         o3d.io.write_point_cloud(str(output_path), point_cloud)
         print(f"✅ Saved point cloud to {output_path}")
         return output_path
+    
+    def convert_point_cloud_format(self, input_path: str, output_format: str = 'ply') -> Path:
+        """
+        Convert point cloud from one format to another.
+        
+        Args:
+            input_path: Path to input point cloud
+            output_format: Desired output format (ply, pcd, xyz, etc.)
+            
+        Returns:
+            Path to converted file
+        """
+        print(f"Converting {input_path} to {output_format} format...")
+        pcd = self.load_vggt_point_cloud(input_path)
+        
+        input_name = Path(input_path).stem
+        output_filename = f"{input_name}.{output_format}"
+        
+        return self.save_point_cloud(pcd, output_filename, format=output_format)
     
     def visualize_point_cloud(self, point_cloud: o3d.geometry.PointCloud, window_name: str = "Point Cloud"):
         """Visualize point cloud with Open3D."""
@@ -640,15 +782,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Convert VGGT output (.npy/.pkl) to PLY format
+  python vggt_refinement_pipeline.py --scene_dir /path/to/scene --point_cloud output.npy --convert_format ply
+  
   # Basic refinement with Bundle Adjustment
-  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply --use_ba
+  python vggt_refinement_pipeline.py --scene_dir /path/to/scene --point_cloud output.ply --use_ba
   
   # With metric scaling using known distance
-  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply \\
+  python vggt_refinement_pipeline.py --scene_dir /path/to/scene --point_cloud output.pkl \\
     --known_distance 2.5 --point_indices 100 500
   
   # With GCP file
-  python vggt_refinement_pipeline_v2.py --scene_dir /path/to/scene --point_cloud output.ply \\
+  python vggt_refinement_pipeline.py --scene_dir /path/to/scene --point_cloud output.npy \\
     --gcp_file ground_control_points.json --visualize
         """
     )
@@ -731,6 +876,12 @@ Examples:
         action="store_true",
         help="Visualize results"
     )
+    parser.add_argument(
+        "--convert_format",
+        type=str,
+        choices=['ply', 'pcd', 'xyz', 'xyzrgb', 'pts'],
+        help="Convert point cloud to specified format and save"
+    )
     
     args = parser.parse_args()
     
@@ -751,6 +902,20 @@ Examples:
     # Load point cloud
     if args.point_cloud:
         point_cloud = pipeline.load_vggt_point_cloud(args.point_cloud)
+        
+        # If format conversion requested, do it and exit
+        if args.convert_format:
+            print(f"\n{'='*60}")
+            print(f"FORMAT CONVERSION: {Path(args.point_cloud).suffix} → .{args.convert_format}")
+            print(f"{'='*60}")
+            output_path = pipeline.save_point_cloud(
+                point_cloud, 
+                f"converted.{args.convert_format}",
+                format=args.convert_format
+            )
+            print(f"\n✅ Conversion complete!")
+            print(f"📁 Output: {output_path}")
+            return
     else:
         print("⚠️  No point cloud specified. Skipping to next steps.")
         pipeline.print_summary()
