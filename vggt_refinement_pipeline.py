@@ -90,6 +90,14 @@ class VGGTRefinementPipeline:
         print("⚠️  demo_colmap.py not found. Make sure VGGT is properly installed.")
         return False
     
+    def check_vggt_module(self) -> bool:
+        """Check if vggt module is installed."""
+        try:
+            import vggt
+            return True
+        except ImportError:
+            return False
+    
     def run_bundle_adjustment(
         self, 
         max_query_pts: int = 4096,
@@ -135,6 +143,16 @@ class VGGTRefinementPipeline:
         
         if use_ba:
             cmd.append("--use_ba")
+        
+        # Check if vggt module is installed
+        if not self.check_vggt_module():
+            print("\n❌ Error: vggt module not installed!")
+            print("\nThe VGGT package needs to be installed. Run:")
+            print("  cd /kaggle/working/vggt")
+            print("  pip install -e .")
+            print("\nOr install from the repository:")
+            print("  pip install git+https://github.com/facebookresearch/vggt.git")
+            return None
         
         print(f"Running command: {' '.join(cmd)}")
         print("\nNote: This may take a while (especially on first run)...\n")
@@ -518,6 +536,27 @@ class VGGTRefinementPipeline:
         print(f"Loading VGGT point cloud from {point_cloud_path}")
         
         path = Path(point_cloud_path)
+        
+        # If path is a directory, look for point cloud files
+        if path.is_dir():
+            print(f"⚠️  Path is a directory. Searching for point cloud files...")
+            
+            # Search for common point cloud files
+            for pattern in ['*.ply', '*.pcd', '*.npy', '*.npz']:
+                files = list(path.glob(pattern))
+                if files:
+                    # Use the first found file
+                    path = files[0]
+                    print(f"✓ Found point cloud file: {path.name}")
+                    break
+            else:
+                raise ValueError(
+                    f"No point cloud files found in directory: {point_cloud_path}\n"
+                    f"Expected files with extensions: .ply, .pcd, .npy, .npz"
+                )
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Point cloud file not found: {path}")
         
         if path.suffix in ['.ply', '.pcd']:
             pcd = o3d.io.read_point_cloud(str(path))
