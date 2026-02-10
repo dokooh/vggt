@@ -211,6 +211,18 @@ class VGGTRefinementPipeline:
             print(f"\nSTDOUT:\n{e.stdout}")
             print(f"\nSTDERR:\n{e.stderr}")
             
+            # Check for reconstruction failure
+            if "No reconstruction can be built with BA" in e.stderr or "No reconstruction can be built" in e.stdout:
+                print(f"\n🔴 BUNDLE ADJUSTMENT FAILED - No Reconstruction Built")
+                print("\nThis means the frames don't have enough feature matches for BA.")
+                print("\nRecommendations:")
+                print("  1. Use the VGGT point cloud directly (skip BA):")
+                print("     python vggt_refinement_pipeline.py --point_cloud output.pkl --no_denoise")
+                print("  2. Reduce matching threshold (edit demo_colmap.py):")
+                print("     Increase 'vis_thresh' or reduce 'conf_thres_value'")
+                print("  3. Use more frames in the video")
+                return None
+            
             # Check for CUDA out of memory
             if "OutOfMemoryError" in e.stderr or "out of memory" in e.stderr.lower():
                 print(f"\n🔴 CUDA OUT OF MEMORY ERROR")
@@ -658,12 +670,21 @@ class VGGTRefinementPipeline:
                     print(f"  Using 'world_points' as point coordinates")
                     # Try to use confidence as colors
                     if 'world_points_conf' in data:
-                        conf = np.array(data['world_points_conf'])
+                        conf = np.array(data['world_points_conf'], dtype=np.float32)
                         if conf.ndim == 1:
-                            conf = np.repeat(conf[:, np.newaxis], 3, axis=1)
-                        # Normalize confidence to 0-1
-                        if conf.max() > 1.0:
-                            conf = conf / 255.0
+                            # Normalize confidence to 0-1 first
+                            if conf.max() > 1.0:
+                                conf = conf / 255.0
+                            # Repeat to RGB
+                            conf = np.repeat(conf[:, np.newaxis], 3, axis=1).astype(np.float32)
+                        else:
+                            # Already 2D, just normalize
+                            if conf.max() > 1.0:
+                                conf = conf / 255.0
+                            conf = conf.astype(np.float32)
+                        
+                        # Clamp to [0, 1]
+                        conf = np.clip(conf, 0.0, 1.0)
                         pcd.colors = o3d.utility.Vector3dVector(conf)
                 elif 'points' in data:
                     points = np.array(data['points'])
