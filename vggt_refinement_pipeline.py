@@ -108,6 +108,7 @@ class VGGTRefinementPipeline:
         use_ba: bool = True,
         demo_script_path: Optional[str] = None,
         reduce_memory: bool = False,
+        disable_fine_tracking: bool = False,
         memory_fraction: Optional[float] = None
     ) -> Optional[Path]:
         """
@@ -119,6 +120,7 @@ class VGGTRefinementPipeline:
             use_ba: Enable bundle adjustment
             demo_script_path: Path to demo_colmap.py (auto-detect if None)
             reduce_memory: Reduce memory usage by lowering query points and frames
+            disable_fine_tracking: Disable fine tracking (saves significant memory)
             memory_fraction: Limit GPU memory usage (0.0-1.0, e.g., 0.5 for 50%)
             
         Returns:
@@ -131,10 +133,12 @@ class VGGTRefinementPipeline:
         # Reduce memory parameters if requested
         if reduce_memory:
             print("\n⚠️  Memory reduction mode enabled")
-            max_query_pts = min(max_query_pts, 1024)
-            query_frame_num = max(1, query_frame_num - 1)
+            max_query_pts = min(max_query_pts, 512)
+            query_frame_num = 1
+            disable_fine_tracking = True
             print(f"   Reduced query points to: {max_query_pts}")
             print(f"   Reduced query frames to: {query_frame_num}")
+            print(f"   Disabled fine tracking to save memory")
         
         # Setup GPU memory management
         gpu_env = os.environ.copy()
@@ -171,6 +175,10 @@ class VGGTRefinementPipeline:
         if use_ba:
             cmd.append("--use_ba")
         
+        if disable_fine_tracking:
+            cmd.append("--no_fine_tracking")
+            print("\n⚠️  Fine tracking disabled (for memory efficiency)")
+        
         # Check if vggt module is installed
         if not self.check_vggt_module():
             print("\n❌ Error: vggt module not installed!")
@@ -206,16 +214,17 @@ class VGGTRefinementPipeline:
             # Check for CUDA out of memory
             if "OutOfMemoryError" in e.stderr or "out of memory" in e.stderr.lower():
                 print(f"\n🔴 CUDA OUT OF MEMORY ERROR")
-                print("\nSuggested fixes:")
-                print("  1. Reduce query points:")
-                print("     python vggt_refinement_pipeline.py --use_ba --max_query_pts 512 --query_frame_num 1")
-                print("  2. Enable memory reduction mode:")
+                print("\nSuggested fixes (try in order):")
+                print("  1. BEST: Skip BA and just use point cloud refinement:")
+                print("     python vggt_refinement_pipeline.py --point_cloud output.pkl --no_denoise")
+                print("  2. Disable fine tracking (saves ~50% memory):")
+                print("     python vggt_refinement_pipeline.py --use_ba --disable_fine_tracking")
+                print("  3. Ultra memory reduction:")
                 print("     python vggt_refinement_pipeline.py --use_ba --reduce_memory")
-                print("  3. Clear GPU memory and retry:")
-                print("     import torch; torch.cuda.empty_cache()")
-                print("  4. Use fewer input frames (downsample the video)")
-                print("  5. Run on CPU (slower but no memory limit):")
-                print("     CUDA_VISIBLE_DEVICES='' python vggt_refinement_pipeline.py ...")
+                print("  4. Very aggressive settings:")
+                print("     python vggt_refinement_pipeline.py --use_ba --max_query_pts 256 --query_frame_num 1 --disable_fine_tracking")
+                print("  5. Run on CPU (very slow):")
+                print("     CUDA_VISIBLE_DEVICES='' python vggt_refinement_pipeline.py --use_ba ...")
                 return None
             
             # Check for missing dependencies
@@ -643,7 +652,20 @@ class VGGTRefinementPipeline:
         if format_type == 'pkl':
             # Handle pickle format - could be dict or direct array
             if isinstance(data, dict):
-                if 'points' in data:
+                # Try common keys first
+                if 'world_points' in data:
+                    points = np.array(data['world_points'])
+                    print(f"  Using 'world_points' as point coordinates")
+                    # Try to use confidence as colors
+                    if 'world_points_conf' in data:
+                        conf = np.array(data['world_points_conf'])
+                        if conf.ndim == 1:
+                            conf = np.repeat(conf[:, np.newaxis], 3, axis=1)
+                        # Normalize confidence to 0-1
+                        if conf.max() > 1.0:
+                            conf = conf / 255.0
+                        pcd.colors = o3d.utility.Vector3dVector(conf)
+                elif 'points' in data:
                     points = np.array(data['points'])
                 elif 'xyz' in data:
                     points = np.array(data['xyz'])
@@ -652,26 +674,32 @@ class VGGTRefinementPipeline:
                 elif 'point_cloud' in data:
                     points = np.array(data['point_cloud'])
                 else:
-                    # Try to find array-like values
+                    # Try to find array-like values with shape (N, 3)
                     for key, value in data.items():
                         if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[1] == 3:
                             points = value
                             print(f"  Using key '{key}' as point coordinates")
                             break
                     else:
-                        raise ValueError(f"Could not find 3D points in pickle data. Keys: {list(data.keys())}")
+                        raise ValueError(
+                            f"Could not find 3D points in pickle data.\n"
+                            f"Available keys: {list(data.keys())}\n"
+                            f"Expected keys: 'world_points', 'points', 'xyz', 'vertices', or similar\n"
+                            f"or any array with shape (N, 3)"
+                        )
                 
                 # Try to extract colors if available
-                if 'colors' in data:
-                    colors = np.array(data['colors'])
-                    if colors.max() > 1.0:
-                        colors = colors / 255.0
-                    pcd.colors = o3d.utility.Vector3dVector(colors)
-                elif 'rgb' in data:
-                    colors = np.array(data['rgb'])
-                    if colors.max() > 1.0:
-                        colors = colors / 255.0
-                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                if not pcd.has_colors():
+                    if 'colors' in data:
+                        colors = np.array(data['colors'])
+                        if colors.max() > 1.0:
+                            colors = colors / 255.0
+                        pcd.colors = o3d.utility.Vector3dVector(colors)
+                    elif 'rgb' in data:
+                        colors = np.array(data['rgb'])
+                        if colors.max() > 1.0:
+                            colors = colors / 255.0
+                        pcd.colors = o3d.utility.Vector3dVector(colors)
             else:
                 # Direct array
                 points = np.array(data)
@@ -694,7 +722,10 @@ class VGGTRefinementPipeline:
         
         elif format_type == 'npz':
             # Handle .npz format
-            if 'points' in data:
+            if 'world_points' in data:
+                points = data['world_points']
+                print(f"  Using 'world_points' from npz")
+            elif 'points' in data:
                 points = data['points']
             elif 'xyz' in data:
                 points = data['xyz']
@@ -885,7 +916,12 @@ Examples:
     parser.add_argument(
         "--reduce_memory",
         action="store_true",
-        help="Enable memory reduction mode (lower query points and frames automatically)"
+        help="Enable memory reduction mode (ultra-low settings for very limited GPU memory)"
+    )
+    parser.add_argument(
+        "--disable_fine_tracking",
+        action="store_true",
+        help="Disable fine tracking in BA (saves a lot of memory but reduces accuracy)"
     )
     parser.add_argument(
         "--memory_fraction",
@@ -948,6 +984,7 @@ Examples:
             use_ba=True,
             demo_script_path=args.demo_script,
             reduce_memory=args.reduce_memory,
+            disable_fine_tracking=args.disable_fine_tracking,
             memory_fraction=args.memory_fraction
         )
         if result is None:
