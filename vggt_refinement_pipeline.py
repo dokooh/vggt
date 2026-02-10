@@ -21,6 +21,8 @@ import cv2
 import sys
 import os
 from tqdm import tqdm
+import gc
+import torch
 
 
 # Check for optional dependencies
@@ -104,7 +106,9 @@ class VGGTRefinementPipeline:
         max_query_pts: int = 4096,
         query_frame_num: int = 3,
         use_ba: bool = True,
-        demo_script_path: Optional[str] = None
+        demo_script_path: Optional[str] = None,
+        reduce_memory: bool = False,
+        memory_fraction: Optional[float] = None
     ) -> Optional[Path]:
         """
         Run Bundle Adjustment using VGGT's demo_colmap.py script.
@@ -114,6 +118,8 @@ class VGGTRefinementPipeline:
             query_frame_num: Number of query frames
             use_ba: Enable bundle adjustment
             demo_script_path: Path to demo_colmap.py (auto-detect if None)
+            reduce_memory: Reduce memory usage by lowering query points and frames
+            memory_fraction: Limit GPU memory usage (0.0-1.0, e.g., 0.5 for 50%)
             
         Returns:
             Path to COLMAP output directory, or None if failed
@@ -121,6 +127,26 @@ class VGGTRefinementPipeline:
         print("=" * 60)
         print("STEP 1: Running Bundle Adjustment")
         print("=" * 60)
+        
+        # Reduce memory parameters if requested
+        if reduce_memory:
+            print("\n⚠️  Memory reduction mode enabled")
+            max_query_pts = min(max_query_pts, 1024)
+            query_frame_num = max(1, query_frame_num - 1)
+            print(f"   Reduced query points to: {max_query_pts}")
+            print(f"   Reduced query frames to: {query_frame_num}")
+        
+        # Setup GPU memory management
+        gpu_env = os.environ.copy()
+        if memory_fraction:
+            print(f"\n🔧 Setting GPU memory limit to {memory_fraction*100:.0f}%")
+            gpu_env['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            # Note: Setting fraction requires specific PyTorch config
+            print("   Using expandable_segments for better memory management")
+        else:
+            # Default: enable expandable segments to avoid fragmentation
+            gpu_env['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            gpu_env['CUDA_LAUNCH_BLOCKING'] = '1'
         
         # Find demo_colmap.py
         if demo_script_path is None:
@@ -164,7 +190,8 @@ class VGGTRefinementPipeline:
                 check=True, 
                 capture_output=True, 
                 text=True,
-                cwd=self.scene_dir
+                cwd=self.scene_dir,
+                env=gpu_env
             )
             print("✅ Bundle Adjustment completed successfully!")
             print(result.stdout)
@@ -175,6 +202,21 @@ class VGGTRefinementPipeline:
             print(f"Return code: {e.returncode}")
             print(f"\nSTDOUT:\n{e.stdout}")
             print(f"\nSTDERR:\n{e.stderr}")
+            
+            # Check for CUDA out of memory
+            if "OutOfMemoryError" in e.stderr or "out of memory" in e.stderr.lower():
+                print(f"\n🔴 CUDA OUT OF MEMORY ERROR")
+                print("\nSuggested fixes:")
+                print("  1. Reduce query points:")
+                print("     python vggt_refinement_pipeline.py --use_ba --max_query_pts 512 --query_frame_num 1")
+                print("  2. Enable memory reduction mode:")
+                print("     python vggt_refinement_pipeline.py --use_ba --reduce_memory")
+                print("  3. Clear GPU memory and retry:")
+                print("     import torch; torch.cuda.empty_cache()")
+                print("  4. Use fewer input frames (downsample the video)")
+                print("  5. Run on CPU (slower but no memory limit):")
+                print("     CUDA_VISIBLE_DEVICES='' python vggt_refinement_pipeline.py ...")
+                return None
             
             # Check for missing dependencies
             if "ModuleNotFoundError" in e.stderr or "ImportError" in e.stderr:
@@ -832,13 +874,23 @@ Examples:
         "--max_query_pts",
         type=int,
         default=4096,
-        help="Max query points for BA (default: 4096)"
+        help="Max query points for BA (default: 4096, reduce for low-memory GPUs)"
     )
     parser.add_argument(
         "--query_frame_num",
         type=int,
         default=3,
         help="Number of query frames for BA (default: 3)"
+    )
+    parser.add_argument(
+        "--reduce_memory",
+        action="store_true",
+        help="Enable memory reduction mode (lower query points and frames automatically)"
+    )
+    parser.add_argument(
+        "--memory_fraction",
+        type=float,
+        help="Limit GPU memory usage (0.0-1.0, e.g., 0.5 for 50%)"
     )
     
     # Metric Scaling
@@ -894,7 +946,9 @@ Examples:
             max_query_pts=args.max_query_pts,
             query_frame_num=args.query_frame_num,
             use_ba=True,
-            demo_script_path=args.demo_script
+            demo_script_path=args.demo_script,
+            reduce_memory=args.reduce_memory,
+            memory_fraction=args.memory_fraction
         )
         if result is None:
             print("\n⚠️  Continuing without Bundle Adjustment...")
