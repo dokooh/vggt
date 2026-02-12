@@ -630,8 +630,63 @@ class VGGTRefinementPipeline:
             
         elif path.suffix == '.pkl':
             # VGGT pickle format
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
+            data = None
+            try:
+                with open(path, 'rb') as f:
+                    data = pickle.load(f)
+            except (pickle.UnpicklingError, ModuleNotFoundError, AttributeError) as e:
+                error_str = str(e)
+                
+                if "persistent_id" in error_str:
+                    # This file contains torch.Tensor or numpy objects saved with custom serialization
+                    print(f"  ⚠️  Standard pickle failed, this appears to be torch-serialized")
+                    print(f"  Attempting torch.load()...")
+                    
+                    try:
+                        data = torch.load(path, weights_only=False)
+                        print(f"  ✓ Successfully loaded with torch.load()")
+                    except Exception as e2:
+                        print(f"  ⚠️  torch.load() failed: {str(e2)[:100]}")
+                        
+                        # Last resort: custom persistent_load handler
+                        print(f"  Attempting custom unpickler with persistent_id handler...")
+                        try:
+                            def persistent_load(pid):
+                                # Return None for persistent IDs as fallback
+                                return None
+                            
+                            with open(path, 'rb') as f:
+                                unpickler = pickle.Unpickler(f)
+                                unpickler.persistent_load = persistent_load
+                                data = unpickler.load()
+                            
+                            print(f"  ⚠️  Loaded with fallback handler (may lose torch tensor data)")
+                        except Exception as e3:
+                            raise RuntimeError(
+                                f"\n❌ Failed to load pickle file '{path.name}':\n"
+                                f"This appears to be a torch-serialized pickle file.\n\n"
+                                f"Attempted 3 loading strategies (all failed):\n"
+                                f"  1. Standard pickle.load()\n"
+                                f"  2. torch.load() with weights_only=False\n"
+                                f"  3. Custom persistent_load handler\n\n"
+                                f"Troubleshooting:\n"
+                                f"  • Ensure torch is installed: pip install torch\n"
+                                f"  • Try converting the file manually:\n"
+                                f"    import torch\n"
+                                f"    data = torch.load('{path}')\n"
+                                f"    import pickle\n"
+                                f"    pickle.dump(data, open('{path.stem}_converted.pkl', 'wb'))\n"
+                            )
+                else:
+                    # Other pickle errors
+                    raise RuntimeError(
+                        f"Failed to load pickle file '{path.name}':\n{e}\n"
+                        f"This may be caused by incompatible format, missing dependencies, or corruption."
+                    )
+            
+            if data is None:
+                raise RuntimeError(f"Could not load pickle file: {path}")
+            
             pcd = self._convert_vggt_data_to_pointcloud(data, 'pkl')
             
         elif path.suffix == '.npy':
