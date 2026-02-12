@@ -595,6 +595,21 @@ class VGGTRefinementPipeline:
     
     # ==================== Utility Functions ====================
     
+    def _convert_torch_to_numpy(self, obj):
+        """
+        Recursively convert torch tensors to numpy arrays.
+        Handles dicts, lists, and nested structures.
+        """
+        if isinstance(obj, torch.Tensor):
+            # Move to CPU if on GPU, detach, and convert to numpy
+            return obj.cpu().detach().numpy()
+        elif isinstance(obj, dict):
+            return {k: self._convert_torch_to_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(self._convert_torch_to_numpy(item) for item in obj)
+        else:
+            return obj
+    
     def load_vggt_point_cloud(self, point_cloud_path: str) -> o3d.geometry.PointCloud:
         """Load VGGT point cloud output (supports .npy, .pkl, .npz, .ply, .pcd)."""
         print(f"Loading VGGT point cloud from {point_cloud_path}")
@@ -634,7 +649,8 @@ class VGGTRefinementPipeline:
             try:
                 with open(path, 'rb') as f:
                     data = pickle.load(f)
-            except (pickle.UnpicklingError, ModuleNotFoundError, AttributeError) as e:
+            except Exception as e:
+                # Catch all exceptions (pickle.UnpicklingError, _pickle.UnpicklingError, etc.)
                 error_str = str(e)
                 
                 if "persistent_id" in error_str:
@@ -644,6 +660,8 @@ class VGGTRefinementPipeline:
                     
                     try:
                         data = torch.load(path, weights_only=False)
+                        # Convert any torch tensors to numpy arrays
+                        data = self._convert_torch_to_numpy(data)
                         print(f"  ✓ Successfully loaded with torch.load()")
                     except Exception as e2:
                         print(f"  ⚠️  torch.load() failed: {str(e2)[:100]}")
@@ -677,12 +695,15 @@ class VGGTRefinementPipeline:
                                 f"    import pickle\n"
                                 f"    pickle.dump(data, open('{path.stem}_converted.pkl', 'wb'))\n"
                             )
-                else:
-                    # Other pickle errors
+                elif any(err in error_str.lower() for err in ["pickle", "unpickl", "corrupt", "invalid"]):
+                    # Other pickle-related errors
                     raise RuntimeError(
                         f"Failed to load pickle file '{path.name}':\n{e}\n"
                         f"This may be caused by incompatible format, missing dependencies, or corruption."
                     )
+                else:
+                    # Re-raise other unexpected exceptions
+                    raise
             
             if data is None:
                 raise RuntimeError(f"Could not load pickle file: {path}")
