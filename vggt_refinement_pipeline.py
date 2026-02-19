@@ -620,18 +620,45 @@ class VGGTRefinementPipeline:
         if path.is_dir():
             print(f"⚠️  Path is a directory. Searching for point cloud files...")
             
-            # Search for VGGT output files (prioritize .pkl and .npy from VGGT)
-            for pattern in ['*.pkl', '*.npy', '*.npz', '*.ply', '*.pcd']:
-                files = list(path.glob(pattern))
-                if files:
-                    # Use the first found file
-                    path = files[0]
-                    print(f"✓ Found point cloud file: {path.name}")
+            # Priority order for VGGT output files:
+            # 1. Specific well-known VGGT point cloud file names
+            # 2. Any .ply or .pcd (already converted point clouds)
+            # 3. Any .npy or .npz (numpy arrays)
+            # 4. Any .pkl (last resort, may not be a point cloud)
+            PRIORITY_NAMES = [
+                'world_points.pkl', 'world_points.npy',
+                'points3d.pkl', 'points3d.npy',
+                'point_cloud.pkl', 'point_cloud.npy',
+                'pointcloud.pkl', 'pointcloud.npy',
+            ]
+            
+            found = False
+            # First: check well-known VGGT filenames
+            for name in PRIORITY_NAMES:
+                candidate = path / name
+                if candidate.exists():
+                    path = candidate
+                    print(f"✓ Found known VGGT output file: {path.name}")
+                    found = True
                     break
-            else:
+            
+            if not found:
+                # Second: search by extension in priority order
+                for pattern in ['*.ply', '*.pcd', '*.npy', '*.npz', '*.pkl']:
+                    files = sorted(path.glob(pattern))
+                    if files:
+                        path = files[0]
+                        print(f"✓ Found point cloud file: {path.name}")
+                        if len(files) > 1:
+                            print(f"  (Note: {len(files)} {pattern} files found; using first. Use --point_cloud to specify.)")
+                        found = True
+                        break
+            
+            if not found:
                 raise ValueError(
                     f"No point cloud files found in directory: {point_cloud_path}\n"
-                    f"Expected files with extensions: .pkl, .npy, .npz, .ply, .pcd"
+                    f"Expected files with extensions: .pkl, .npy, .npz, .ply, .pcd\n"
+                    f"Tip: Use --point_cloud /path/to/world_points.pkl to specify directly"
                 )
         
         if not path.exists():
@@ -733,8 +760,20 @@ class VGGTRefinementPipeline:
         
         return pcd
     
+    def _tensor_to_numpy(self, value):
+        """Convert a value to numpy, handling CUDA/CPU torch tensors."""
+        if isinstance(value, torch.Tensor):
+            return value.cpu().detach().numpy()
+        return np.array(value)
+    
     def _convert_vggt_data_to_pointcloud(self, data, format_type: str) -> o3d.geometry.PointCloud:
         """Convert VGGT data structures to Open3D point cloud."""
+        # Ensure all torch tensors in data are converted to numpy first
+        if isinstance(data, torch.Tensor):
+            data = data.cpu().detach().numpy()
+        elif isinstance(data, dict):
+            data = self._convert_torch_to_numpy(data)
+        
         pcd = o3d.geometry.PointCloud()
         
         if format_type == 'pkl':
@@ -742,11 +781,11 @@ class VGGTRefinementPipeline:
             if isinstance(data, dict):
                 # Try common keys first
                 if 'world_points' in data:
-                    points = np.array(data['world_points'])
+                    points = self._tensor_to_numpy(data['world_points'])
                     print(f"  Using 'world_points' as point coordinates")
                     # Try to use confidence as colors
                     if 'world_points_conf' in data:
-                        conf = np.array(data['world_points_conf'], dtype=np.float32)
+                        conf = np.array(self._tensor_to_numpy(data['world_points_conf']), dtype=np.float32)
                         if conf.ndim == 1:
                             # Normalize confidence to 0-1 first
                             if conf.max() > 1.0:
@@ -763,18 +802,19 @@ class VGGTRefinementPipeline:
                         conf = np.clip(conf, 0.0, 1.0)
                         pcd.colors = o3d.utility.Vector3dVector(conf)
                 elif 'points' in data:
-                    points = np.array(data['points'])
+                    points = self._tensor_to_numpy(data['points'])
                 elif 'xyz' in data:
-                    points = np.array(data['xyz'])
+                    points = self._tensor_to_numpy(data['xyz'])
                 elif 'vertices' in data:
-                    points = np.array(data['vertices'])
+                    points = self._tensor_to_numpy(data['vertices'])
                 elif 'point_cloud' in data:
-                    points = np.array(data['point_cloud'])
+                    points = self._tensor_to_numpy(data['point_cloud'])
                 else:
                     # Try to find array-like values with shape (N, 3)
                     for key, value in data.items():
-                        if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[1] == 3:
-                            points = value
+                        arr = self._tensor_to_numpy(value) if isinstance(value, (np.ndarray, torch.Tensor)) else None
+                        if arr is not None and arr.ndim == 2 and arr.shape[1] == 3:
+                            points = arr
                             print(f"  Using key '{key}' as point coordinates")
                             break
                     else:
@@ -788,18 +828,18 @@ class VGGTRefinementPipeline:
                 # Try to extract colors if available
                 if not pcd.has_colors():
                     if 'colors' in data:
-                        colors = np.array(data['colors'])
+                        colors = self._tensor_to_numpy(data['colors'])
                         if colors.max() > 1.0:
                             colors = colors / 255.0
                         pcd.colors = o3d.utility.Vector3dVector(colors)
                     elif 'rgb' in data:
-                        colors = np.array(data['rgb'])
+                        colors = self._tensor_to_numpy(data['rgb'])
                         if colors.max() > 1.0:
                             colors = colors / 255.0
                         pcd.colors = o3d.utility.Vector3dVector(colors)
             else:
-                # Direct array
-                points = np.array(data)
+                # Direct array (may be a CUDA tensor)
+                points = self._tensor_to_numpy(data)
                 if points.ndim == 1:
                     points = points.reshape(-1, 3)
             
