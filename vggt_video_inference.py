@@ -9,9 +9,12 @@ import os
 import sys
 import json
 import pickle
+import glob
+import shutil
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
+from visual_util import predictions_to_glb
 
 
 class PredictionSaver:
@@ -499,6 +502,76 @@ class VideoFrameExtractor:
         return selected
 
 
+def _prepare_target_dir(image_names: List[str], target_dir: str) -> str:
+    """
+    Copy images into target_dir/images/ to match the directory structure
+    expected by run_model from demo_gradio.
+
+    Args:
+        image_names: List of source image paths
+        target_dir: Base reconstruction directory
+
+    Returns:
+        str: Path to target_dir
+    """
+    images_dir = os.path.join(target_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    for img_path in image_names:
+        dst = os.path.join(images_dir, os.path.basename(img_path))
+        if not os.path.exists(dst):
+            shutil.copy2(img_path, dst)
+    print(f"Images prepared in: {images_dir}")
+    return target_dir
+
+
+def export_glb(
+    predictions: Dict,
+    output_path: str,
+    conf_thres: float = 50.0,
+    frame_filter: str = "all",
+    mask_black_bg: bool = False,
+    mask_white_bg: bool = False,
+    show_cam: bool = True,
+    mask_sky: bool = False,
+    target_dir: Optional[str] = None,
+    prediction_mode: str = "Predicted Pointmap",
+) -> str:
+    """
+    Export VGGT predictions as a GLB 3D scene file using predictions_to_glb
+    from visual_util (same function used by demo_gradio).
+
+    Args:
+        predictions: Dictionary of model predictions from run_model
+        output_path: Output .glb file path
+        conf_thres: Confidence threshold (percentile) for filtering points
+        frame_filter: Frame filter ("all" or "<index>: <name>" string)
+        mask_black_bg: Mask black background pixels
+        mask_white_bg: Mask white background pixels
+        show_cam: Include camera visualizations
+        mask_sky: Apply sky segmentation mask
+        target_dir: Directory with images/ subfolder (required when mask_sky=True)
+        prediction_mode: "Predicted Pointmap" or "Depthmap and Camera Branch"
+
+    Returns:
+        str: Path to the exported GLB file
+    """
+    print(f"\nExporting GLB scene to: {output_path}")
+    glbscene = predictions_to_glb(
+        predictions,
+        conf_thres=conf_thres,
+        filter_by_frames=frame_filter,
+        mask_black_bg=mask_black_bg,
+        mask_white_bg=mask_white_bg,
+        show_cam=show_cam,
+        mask_sky=mask_sky,
+        target_dir=target_dir,
+        prediction_mode=prediction_mode,
+    )
+    glbscene.export(file_obj=output_path)
+    print(f"GLB exported successfully: {output_path}")
+    return output_path
+
+
 def run_vggt_inference(
     image_names: List[str],
     model_name: str = "facebook/VGGT-1B",
@@ -711,15 +784,80 @@ def main():
         action="store_true",
         help="Don't save predictions"
     )
-    
+
+    # GLB export
+    parser.add_argument(
+        "--target_dir",
+        type=str,
+        help="Base reconstruction directory (will contain images/ subfolder). Derived from video name if not set."
+    )
+    parser.add_argument(
+        "--export_glb",
+        action="store_true",
+        default=True,
+        help="Export GLB file after inference (default: True)"
+    )
+    parser.add_argument(
+        "--glb_output",
+        type=str,
+        help="Output GLB file path (default: <target_dir>/reconstruction.glb)"
+    )
+    parser.add_argument(
+        "--conf_thres",
+        type=float,
+        default=50.0,
+        help="Confidence threshold (percentile) for GLB point filtering (default: 50.0)"
+    )
+    parser.add_argument(
+        "--mask_black_bg",
+        action="store_true",
+        help="Mask black background pixels in GLB export"
+    )
+    parser.add_argument(
+        "--mask_white_bg",
+        action="store_true",
+        help="Mask white background pixels in GLB export"
+    )
+    parser.add_argument(
+        "--no_show_cam",
+        action="store_true",
+        help="Hide camera visualizations in GLB export"
+    )
+    parser.add_argument(
+        "--mask_sky",
+        action="store_true",
+        help="Apply sky segmentation mask in GLB export"
+    )
+    parser.add_argument(
+        "--prediction_mode",
+        type=str,
+        default="Predicted Pointmap",
+        choices=["Predicted Pointmap", "Depthmap and Camera Branch"],
+        help="Prediction mode for GLB export (default: Predicted Pointmap)"
+    )
+
     args = parser.parse_args()
     
-    # Get image names
+    # Determine target_dir and collect image names.
+    # target_dir must contain an images/ subfolder for run_model (demo_gradio).
+    image_names = []
+    target_dir = args.target_dir  # may be None; resolved per branch below
+
     if args.video:
-        # Extract frames from video
+        # Determine target_dir from video name
+        video_stem = Path(args.video).stem
+        if args.target_dir:
+            target_dir = args.target_dir
+        elif args.output_dir:
+            target_dir = os.path.join(args.output_dir, f"{video_stem}_reconstruction")
+        else:
+            target_dir = str(Path.cwd() / f"{video_stem}_reconstruction")
+
+        # Extract frames directly into target_dir/images/ for run_model compatibility
+        frame_output_dir = os.path.join(target_dir, "images")
         extractor = VideoFrameExtractor(
             video_path=args.video,
-            output_dir=args.output_dir,
+            output_dir=frame_output_dir,
             frame_interval=args.frame_interval,
             max_frames=args.max_frames,
             skip_frames=args.skip_frames,
@@ -728,53 +866,72 @@ def main():
             detect_motion_blur=args.detect_blur,
             motion_blur_threshold=args.blur_threshold
         )
-        
         image_names = extractor.extract_frames()
-        
+
         # Select subset if requested
         if args.select_frames:
             image_names = extractor.select_frames_by_parallax(
                 num_frames=args.select_frames,
                 method=args.selection_method
             )
-    
+
     elif args.images:
-        image_names = args.images
-    
+        target_dir = args.target_dir or str(Path.cwd() / "reconstruction")
+        _prepare_target_dir(args.images, target_dir)
+        image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
+
     elif args.image_dir:
         image_dir = Path(args.image_dir)
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        image_names = sorted([
+        raw_image_names = sorted([
             str(p) for p in image_dir.iterdir()
             if p.suffix.lower() in image_extensions
         ])
-        print(f"Found {len(image_names)} images in {image_dir}")
+        print(f"Found {len(raw_image_names)} images in {image_dir}")
+        target_dir = args.target_dir or str(image_dir.parent / f"{image_dir.name}_reconstruction")
+        _prepare_target_dir(raw_image_names, target_dir)
+        image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
     
-    # Run VGGT inference
+    # Run VGGT inference using run_model from demo_gradio
     if not args.skip_inference:
         if not image_names:
             print("Error: No images to process!")
             return
-        
+
+        # Import run_model and the pre-loaded VGGT model from demo_gradio.
+        # This keeps inference behavior consistent with the Gradio demo.
+        from demo_gradio import run_model, model as vggt_model
+
+        print(f"\nRunning run_model on target_dir: {target_dir}")
+        predictions = run_model(target_dir, vggt_model)
+
+        # Save predictions as npz (mirrors demo_gradio's prediction_save_path)
         save_preds = args.save_predictions and not args.skip_save_predictions
-        
-        predictions = run_vggt_inference(
-            image_names=image_names,
-            model_name=args.model,
-            device=args.device,
-            save_predictions=save_preds,
-            predictions_output_dir=args.predictions_dir
-        )
-        
-        # Print saved paths
-        if save_preds and "_saved_paths" in predictions:
-            print("\n" + "=" * 60)
-            print("SAVED FILES SUMMARY")
-            print("=" * 60)
-            for name, path in predictions["_saved_paths"].items():
-                print(f"✅ {name}")
-                print(f"   Path: {path}")
-    
+        if save_preds:
+            prediction_save_path = os.path.join(target_dir, "predictions.npz")
+            saveable = {
+                k: v for k, v in predictions.items()
+                if v is not None and isinstance(v, np.ndarray)
+            }
+            np.savez(prediction_save_path, **saveable)
+            print(f"Predictions saved to: {prediction_save_path}")
+
+        # Export GLB using predictions_to_glb from visual_util
+        if args.export_glb:
+            glb_output = args.glb_output or os.path.join(target_dir, "reconstruction.glb")
+            export_glb(
+                predictions=predictions,
+                output_path=glb_output,
+                conf_thres=args.conf_thres,
+                frame_filter="all",
+                mask_black_bg=args.mask_black_bg,
+                mask_white_bg=args.mask_white_bg,
+                show_cam=not args.no_show_cam,
+                mask_sky=args.mask_sky,
+                target_dir=target_dir if args.mask_sky else None,
+                prediction_mode=args.prediction_mode,
+            )
+
     else:
         print(f"\nSkipping inference. {len(image_names)} frames ready for processing.")
         print("\nImage names:")
