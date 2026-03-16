@@ -14,6 +14,8 @@ import shutil
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
 from visual_util import predictions_to_glb
 
 
@@ -505,7 +507,7 @@ class VideoFrameExtractor:
 def _prepare_target_dir(image_names: List[str], target_dir: str) -> str:
     """
     Copy images into target_dir/images/ to match the directory structure
-    expected by run_model from demo_gradio.
+    expected by run_model.
 
     Args:
         image_names: List of source image paths
@@ -572,92 +574,59 @@ def export_glb(
     return output_path
 
 
-def run_vggt_inference(
-    image_names: List[str],
-    model_name: str = "facebook/VGGT-1B",
-    device: Optional[str] = None,
-    batch_size: int = 1,
-    save_predictions: bool = True,
-    predictions_output_dir: Optional[str] = None
-) -> Dict:
+# -------------------------------------------------------------------------
+# Core model inference
+# -------------------------------------------------------------------------
+def run_model(target_dir, model) -> dict:
     """
-    Run VGGT inference on images.
-    
-    Args:
-        image_names: List of image paths
-        model_name: VGGT model name
-        device: Device to run on (auto-detect if None)
-        batch_size: Process images in batches
-        save_predictions: Whether to save predictions
-        predictions_output_dir: Directory to save predictions
-        
-    Returns:
-        Dictionary of predictions
+    Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     """
-    print("\n" + "=" * 60)
-    print("RUNNING VGGT INFERENCE")
-    print("=" * 60)
-    
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"Device: {device}")
-    
-    # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
-    if device == "cuda":
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        print(f"Precision: {dtype}")
-    else:
-        dtype = torch.float32
-    
-    # Initialize the model and load the pretrained weights
-    print(f"\nLoading model: {model_name}")
-    print("(This will download weights on first run)")
-    model = VGGT.from_pretrained(model_name).to(device)
-    
-    print(f"\nProcessing {len(image_names)} images...")
-    
+    print(f"Processing images from {target_dir}")
+
+    # Device check
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA is not available. Check your environment.")
+
+    # Move model to device
+    model = model.to(device)
+    model.eval()
+
     # Load and preprocess images
+    image_names = glob.glob(os.path.join(target_dir, "images", "*"))
+    image_names = sorted(image_names)
+    print(f"Found {len(image_names)} images")
+    if len(image_names) == 0:
+        raise ValueError("No images found. Check your upload.")
+
     images = load_and_preprocess_images(image_names).to(device)
-    
-    print(f"Image tensor shape: {images.shape}")
-    
+    print(f"Preprocessed images shape: {images.shape}")
+
     # Run inference
-    print("\nRunning inference...")
+    print("Running inference...")
     with torch.no_grad():
-        if device == "cuda":
-            with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model(images)
-        else:
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             predictions = model(images)
-    
-    print("Inference complete!")
-    
-    # Print prediction info
-    print("\nPredictions:")
-    for key, value in predictions.items():
-        if torch.is_tensor(value):
-            print(f"  {key}: {value.shape} ({value.dtype})")
-        else:
-            print(f"  {key}: {type(value)}")
-    
-    # Save predictions
-    if save_predictions:
-        if predictions_output_dir is None:
-            if os.path.exists("/kaggle/working"):
-                predictions_output_dir = "/kaggle/working"
-            else:
-                predictions_output_dir = os.getcwd()
-        
-        saver = PredictionSaver(predictions_output_dir)
-        saved_paths = saver.save_predictions(
-            predictions=predictions,
-            image_names=image_names,
-            formats=["numpy", "pickle", "json_metadata", "full_pickle", "depth_png"]
-        )
-        
-        predictions["_saved_paths"] = saved_paths
-    
+
+    # Convert pose encoding to extrinsic and intrinsic matrices
+    print("Converting pose encoding to extrinsic and intrinsic matrices...")
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+    predictions["extrinsic"] = extrinsic
+    predictions["intrinsic"] = intrinsic
+
+    # Convert tensors to numpy
+    for key in predictions.keys():
+        if isinstance(predictions[key], torch.Tensor):
+            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
+
+    # Generate world points from depth map
+    print("Computing world points from depth map...")
+    depth_map = predictions["depth"]  # (S, H, W, 1)
+    world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
+    predictions["world_points_from_depth"] = world_points
+
+    # Clean up
+    torch.cuda.empty_cache()
     return predictions
 
 
@@ -892,18 +861,17 @@ def main():
         _prepare_target_dir(raw_image_names, target_dir)
         image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
     
-    # Run VGGT inference using run_model from demo_gradio
+    # Run VGGT inference using run_model
     if not args.skip_inference:
         if not image_names:
             print("Error: No images to process!")
             return
 
-        # Import run_model and the pre-loaded VGGT model from demo_gradio.
-        # This keeps inference behavior consistent with the Gradio demo.
-        from demo_gradio import run_model, model as vggt_model
+        print(f"\nLoading model: {args.model}")
+        model = VGGT.from_pretrained(args.model)
 
         print(f"\nRunning run_model on target_dir: {target_dir}")
-        predictions = run_model(target_dir, vggt_model)
+        predictions = run_model(target_dir, model)
 
         # Save predictions as npz (mirrors demo_gradio's prediction_save_path)
         save_preds = args.save_predictions and not args.skip_save_predictions
