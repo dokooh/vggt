@@ -644,7 +644,7 @@ class VGGTRefinementPipeline:
             
             if not found:
                 # Second: search by extension in priority order
-                for pattern in ['*.ply', '*.pcd', '*.npy', '*.npz', '*.pkl']:
+                for pattern in ['*.glb', '*.ply', '*.pcd', '*.npy', '*.npz', '*.pkl']:
                     files = sorted(path.glob(pattern))
                     if files:
                         path = files[0]
@@ -657,8 +657,8 @@ class VGGTRefinementPipeline:
             if not found:
                 raise ValueError(
                     f"No point cloud files found in directory: {point_cloud_path}\n"
-                    f"Expected files with extensions: .pkl, .npy, .npz, .ply, .pcd\n"
-                    f"Tip: Use --point_cloud /path/to/world_points.pkl to specify directly"
+                    f"Expected files with extensions: .glb, .pkl, .npy, .npz, .ply, .pcd\n"
+                    f"Tip: Use --point_cloud /path/to/reconstruction.glb to specify directly"
                 )
         
         if not path.exists():
@@ -669,7 +669,17 @@ class VGGTRefinementPipeline:
         # Load based on file format
         if path.suffix in ['.ply', '.pcd']:
             pcd = o3d.io.read_point_cloud(str(path))
-            
+
+        elif path.suffix == '.glb':
+            if not OPTIONAL_DEPS.get('trimesh'):
+                raise ImportError(
+                    "trimesh is required to load GLB files. "
+                    "Install with: pip install trimesh"
+                )
+            import trimesh
+            scene = trimesh.load(str(path))
+            pcd = self._convert_glb_to_pointcloud(scene)
+
         elif path.suffix == '.pkl':
             # VGGT pickle format
             data = None
@@ -752,14 +762,94 @@ class VGGTRefinementPipeline:
         
         print(f"✅ Loaded {len(pcd.points)} points")
         
-        # Auto-save as PLY if source was not PLY
-        if path.suffix not in ['.ply', '.pcd']:
+        # Auto-save as PLY if source was not already a standard point cloud format
+        if path.suffix not in ['.ply', '.pcd', '.glb']:
             ply_path = self.pointclouds_dir / f"{path.stem}_converted.ply"
             o3d.io.write_point_cloud(str(ply_path), pcd)
             print(f"💾 Saved PLY version to: {ply_path.name}")
         
         return pcd
     
+    def _convert_glb_to_pointcloud(self, scene) -> o3d.geometry.PointCloud:
+        """
+        Convert a trimesh Scene (loaded from GLB) to an Open3D point cloud.
+
+        Handles both trimesh.PointCloud geometry (exported by predictions_to_glb)
+        and trimesh.Trimesh geometry (camera meshes and other meshes in the scene).
+        Only PointCloud geometries are used for reconstruction points; Trimesh
+        geometries (cameras, etc.) are skipped by default to keep the result clean.
+
+        Args:
+            scene: trimesh.Scene, trimesh.PointCloud, or trimesh.Trimesh
+
+        Returns:
+            Open3D PointCloud
+        """
+        import trimesh as tm
+
+        all_points = []
+        all_colors = []
+
+        # Normalise to a flat list of geometries
+        if isinstance(scene, tm.Scene):
+            geometries = list(scene.geometry.values())
+        else:
+            geometries = [scene]
+
+        point_cloud_geoms = [g for g in geometries if isinstance(g, tm.PointCloud)]
+        mesh_geoms = [g for g in geometries if isinstance(g, tm.Trimesh)]
+
+        # Prefer PointCloud geometries (these are the VGGT reconstruction points)
+        target_geoms = point_cloud_geoms if point_cloud_geoms else mesh_geoms
+
+        if not target_geoms:
+            raise ValueError(
+                "No geometry found in GLB file. "
+                "Expected trimesh.PointCloud or trimesh.Trimesh objects."
+            )
+
+        if point_cloud_geoms:
+            print(f"  Found {len(point_cloud_geoms)} PointCloud geometry(s) in GLB")
+        else:
+            print(f"  No PointCloud geometries found; extracting vertices from {len(mesh_geoms)} mesh(es)")
+
+        for geom in target_geoms:
+            if isinstance(geom, tm.PointCloud):
+                pts = np.asarray(geom.vertices)
+                all_points.append(pts)
+                if geom.colors is not None and len(geom.colors) > 0:
+                    colors = np.asarray(geom.colors, dtype=np.float32)[:, :3]
+                    # trimesh stores colors as uint8 (0-255)
+                    if colors.max() > 1.0:
+                        colors = colors / 255.0
+                    all_colors.append(colors)
+            elif isinstance(geom, tm.Trimesh):
+                pts = np.asarray(geom.vertices)
+                all_points.append(pts)
+                try:
+                    vc = geom.visual.to_color().vertex_colors
+                    if vc is not None and len(vc) > 0:
+                        colors = np.asarray(vc, dtype=np.float32)[:, :3]
+                        if colors.max() > 1.0:
+                            colors = colors / 255.0
+                        all_colors.append(colors)
+                    else:
+                        all_colors.append(np.ones((len(pts), 3), dtype=np.float32) * 0.7)
+                except Exception:
+                    all_colors.append(np.ones((len(pts), 3), dtype=np.float32) * 0.7)
+
+        if not all_points:
+            raise ValueError("Could not extract any points from GLB geometries.")
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+
+        if all_colors and len(all_colors) == len(all_points):
+            pcd.colors = o3d.utility.Vector3dVector(np.vstack(all_colors))
+
+        print(f"  Extracted {len(pcd.points)} points from GLB")
+        return pcd
+
     def _tensor_to_numpy(self, value):
         """Convert a value to numpy, handling CUDA/CPU torch tensors."""
         if isinstance(value, torch.Tensor):
